@@ -1,0 +1,16 @@
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+.kotlin/
+reference/
+keystore/
+*.jks
+*.keystore
+keystore.properties
+
+# Private notes and local test helpers (kept on the local-history branch only)
+CLAUDE.md
+PLAN.md
+tools/

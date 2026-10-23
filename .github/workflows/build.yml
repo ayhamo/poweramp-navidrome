@@ -1,0 +1,96 @@
+# Builds the APK from this repository's source, on GitHub's machines.
+# - Pull requests: debug build only (no access to the signing key).
+# - Pushes to main: signed release build, uploaded as a workflow artifact.
+# - Tags v*: the same, plus a build attestation and a GitHub release with the APK and its SHA-256.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # The release signing certificate. A build signed with any other key fails here.
+  EXPECTED_CERT_SHA256: ab86fe6a361db60045f3393d99361b1a1362afae6dcab2aaff0cf20d1e9803a1
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write      # create the release
+      id-token: write      # sign the attestation
+      attestations: write  # store the attestation
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.14.3'
+
+      - name: Android SDK packages
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0" > /dev/null
+
+      - name: Debug build (pull requests)
+        if: github.event_name == 'pull_request'
+        run: gradle --no-daemon assembleDebug
+
+      - name: Version
+        if: github.event_name != 'pull_request'
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "VERSION_NAME=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION_NAME=0.0.0-dev+${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
+          echo "VERSION_CODE=${{ github.run_number }}" >> "$GITHUB_ENV"
+
+      - name: Signed release build
+        if: github.event_name != 'pull_request'
+        env:
+          SIGNING_KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          export SIGNING_KEYSTORE="$RUNNER_TEMP/release.jks"
+          echo "$SIGNING_KEYSTORE_BASE64" | base64 -d > "$SIGNING_KEYSTORE"
+          gradle --no-daemon assembleRelease
+          rm -f "$SIGNING_KEYSTORE"
+
+      - name: Check the signature
+        if: github.event_name != 'pull_request'
+        run: |
+          apk=app/build/outputs/apk/release/app-release.apk
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "$apk" | tee certs.txt
+          grep -q "SHA-256 digest: $EXPECTED_CERT_SHA256" certs.txt
+          name="navidrome-for-poweramp-$VERSION_NAME.apk"
+          mkdir out
+          cp "$apk" "out/$name"
+          (cd out && sha256sum "$name" > "$name.sha256")
+          cat out/*.sha256
+
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: apk
+          path: out/
+
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: out/*.apk
+
+      - name: GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/* --title "$GITHUB_REF_NAME" --generate-notes
